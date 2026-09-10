@@ -11,6 +11,17 @@ const allowedOrigins = [process.env.allowed_origin];
 // import utility functions
 const { generateSVG } = require('./utils/generateSVG');
 const { packTo1Bit } = require('./utils/packTo1Bit');
+const { generateSVGColor } = require('./utils/generateSVGColor');
+const { packToIndexed4BPP } = require('./utils/packToIndexed4BPP');
+const { getLunarInfo } = require('./utils/lunarCalendar');
+const { getChineseMonthLabel } = require('./utils/chineseMonth');
+const { isPublicHoliday } = require('./utils/publicHolidays');
+const { generateFontGallerySVG, CJK_CANDIDATE_FONTS } = require('./utils/generateFontGallery');
+
+// NEA's 24-hour forecast (data.gov.sg) - no API key required.
+const NEA_24HR_FORECAST_URL = 'https://api-open.data.gov.sg/v2/real-time/api/twenty-four-hr-forecast';
+// NEA's PSI (air quality) readings, one per region - no API key required.
+const NEA_PSI_URL = 'https://api-open.data.gov.sg/v2/real-time/api/psi';
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -32,26 +43,104 @@ app.get('/', (req, res) => {
   res.send('API caller is running');
 });
 
-// TODO: call a weather API (e.g. Open-Meteo, OpenWeatherMap) for today's forecast
+// Fetches Singapore's general 24-hour forecast (today's high/low, humidity,
+// wind and forecast text) from NEA via data.gov.sg.
 async function getWeatherData() {
-  throw new Error('getWeatherData not implemented yet');
+  const response = await axios.get(NEA_24HR_FORECAST_URL);
+  const { general } = response.data.data.records[0];
+
+  return {
+    forecastText: general.forecast.text,
+    tempHigh: general.temperature.high,
+    tempLow: general.temperature.low,
+    humidityHigh: general.relativeHumidity.high,
+    humidityLow: general.relativeHumidity.low,
+    windDirection: general.wind.direction,
+    windSpeedLow: general.wind.speed.low,
+    windSpeedHigh: general.wind.speed.high,
+  };
 }
 
-// TODO: call a calendar source (e.g. Google Calendar API, an .ics feed) for today's events
+// Fetches NEA's PSI and PM2.5 (air quality) readings, both reported per
+// region (west/east/central/north/south) rather than as one nationwide
+// number, so this takes the min/max across all five - same "range"
+// treatment as humidity/wind. PSI is the official composite index; PM2.5 is
+// the specific fine-particulate reading (ug/m3) PSI's worst sub-index is
+// often driven by, shown alongside it since it's the pollutant most closely
+// tied to health effects.
+async function getAirQualityData() {
+  const response = await axios.get(NEA_PSI_URL);
+  const { readings } = response.data.data.items[0];
+  const psiValues = Object.values(readings.psi_twenty_four_hourly);
+  const pm25Values = Object.values(readings.pm25_twenty_four_hourly);
+
+  return {
+    psiLow: Math.min(...psiValues),
+    psiHigh: Math.max(...psiValues),
+    pm25Low: Math.min(...pm25Values),
+    pm25High: Math.max(...pm25Values),
+  };
+}
+
+// Builds today's date fields (Gregorian + lunar) for the tear-away calendar
+// page, anchored to Singapore time regardless of the server's own timezone.
 async function getCalendarData() {
-  throw new Error('getCalendarData not implemented yet');
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Singapore',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'long',
+  });
+  const monthNumFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Singapore',
+    month: 'numeric',
+  });
+
+  const parts = Object.fromEntries(formatter.formatToParts(now).map((p) => [p.type, p.value]));
+  const year = Number(parts.year);
+  const day = Number(parts.day);
+  const monthNum = Number(monthNumFormatter.format(now));
+
+  const lunar = getLunarInfo(year, monthNum, day);
+  const chineseMonthLabel = getChineseMonthLabel(year, monthNum);
+  const isoDate = `${year}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const publicHoliday = await isPublicHoliday(isoDate);
+
+  return {
+    day,
+    month: parts.month,
+    year,
+    weekdayEnglish: parts.weekday,
+    chineseMonthLabel,
+    isPublicHoliday: publicHoliday,
+    ...lunar,
+  };
+}
+
+async function buildDisplayData() {
+  const [weather, airQuality, calendar] = await Promise.all([
+    getWeatherData(),
+    getAirQualityData(),
+    getCalendarData(),
+  ]);
+  return { weather: { ...weather, ...airQuality }, calendar };
+}
+
+async function buildDisplaySVG() {
+  return generateSVG(await buildDisplayData());
+}
+
+async function buildDisplaySVGColor() {
+  return generateSVGColor(await buildDisplayData());
 }
 
 // Core endpoint the ESP32 polls: builds today's calendar + weather layout as a
 // 1-bit packed bitmap, matching bus_where's SVG -> sharp -> packTo1Bit pipeline.
 app.get('/api/create-display-image', async (req, res) => {
   try {
-    const [weather, calendar] = await Promise.all([
-      getWeatherData(),
-      getCalendarData(),
-    ]);
-
-    const svgContent = generateSVG({ weather, calendar });
+    const svgContent = await buildDisplaySVG();
 
     const rawBuffer = await sharp(Buffer.from(svgContent))
       .resize(800, 480, {
@@ -72,6 +161,114 @@ app.get('/api/create-display-image', async (req, res) => {
   } catch (err) {
     console.error('Image generation error:', err);
     res.status(500).send('Image generation failed');
+  }
+});
+
+// Dev-only preview: same layout, rendered as a plain PNG so it can be viewed
+// directly in a browser instead of the ESP32's packed 1-bit format.
+app.get('/api/preview', async (req, res) => {
+  try {
+    const svgContent = await buildDisplaySVG();
+
+    const png = await sharp(Buffer.from(svgContent))
+      .resize(800, 480, {
+        fit: 'contain',
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .png()
+      .toBuffer();
+
+    res.setHeader('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    console.error('Preview generation error:', err);
+    res.status(500).send('Preview generation failed');
+  }
+});
+
+// Core endpoint for the 13.3" Spectra 6 color panel (Seeed EE02 board):
+// builds the same layout in portrait color, packed indexed 4bpp for
+// Seeed_GFX2's pushImage4BPP (1200x1600, 960,000 bytes).
+app.get('/api/create-display-image-color', async (req, res) => {
+  try {
+    const svgContent = await buildDisplaySVGColor();
+
+    const rawBuffer = await sharp(Buffer.from(svgContent))
+      .resize(1200, 1600, {
+        fit: 'contain',
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .removeAlpha()
+      .raw()
+      .toBuffer();
+
+    const finalBuffer = packToIndexed4BPP(rawBuffer, 1200, 1600);
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', finalBuffer.length);
+    res.send(finalBuffer);
+
+    console.log('Sent color bitmap to ESP32. Size:', finalBuffer.length);
+  } catch (err) {
+    console.error('Color image generation error:', err);
+    res.status(500).send('Image generation failed');
+  }
+});
+
+// Dev-only preview of the color layout, rendered as a plain PNG.
+app.get('/api/preview-color', async (req, res) => {
+  try {
+    const svgContent = await buildDisplaySVGColor();
+
+    const png = await sharp(Buffer.from(svgContent))
+      .resize(1200, 1600, {
+        fit: 'contain',
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .png()
+      .toBuffer();
+
+    res.setHeader('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    console.error('Color preview generation error:', err);
+    res.status(500).send('Preview generation failed');
+  }
+});
+
+// Dev-only: compares candidate fonts side by side (day number + header
+// sample) so you can eyeball options without editing generateSVGColor.js
+// and reloading one at a time. Pass ?fonts=Font%20One,Font%20Two to
+// override the built-in candidate list.
+app.get('/api/font-gallery', async (req, res) => {
+  try {
+    const fonts = req.query.fonts ? req.query.fonts.split(',') : undefined;
+    const svgContent = generateFontGallerySVG(fonts);
+
+    const png = await sharp(Buffer.from(svgContent)).png().toBuffer();
+
+    res.setHeader('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    console.error('Font gallery generation error:', err);
+    res.status(500).send('Font gallery generation failed');
+  }
+});
+
+// Same as /api/font-gallery, for the Chinese text (weekday, lunar date,
+// month label) instead of the Latin header/day number.
+app.get('/api/font-gallery-cjk', async (req, res) => {
+  try {
+    const fonts = req.query.fonts ? req.query.fonts.split(',') : CJK_CANDIDATE_FONTS;
+    const svgContent = generateFontGallerySVG(fonts, '廿九', '九月小 · 星期四 · 丙午年 属马');
+
+    const png = await sharp(Buffer.from(svgContent)).png().toBuffer();
+
+    res.setHeader('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    console.error('CJK font gallery generation error:', err);
+    res.status(500).send('CJK font gallery generation failed');
   }
 });
 
