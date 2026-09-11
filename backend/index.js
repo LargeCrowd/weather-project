@@ -17,6 +17,10 @@ const { getLunarInfo } = require('./utils/lunarCalendar');
 const { getChineseMonthLabel } = require('./utils/chineseMonth');
 const { isPublicHoliday } = require('./utils/publicHolidays');
 const { generateFontGallerySVG, CJK_CANDIDATE_FONTS } = require('./utils/generateFontGallery');
+const { getLiveStationData } = require('./utils/liveStationData');
+const { getUvIndexData } = require('./utils/uvIndex');
+const { getFeelsLikeTemp } = require('./utils/feelsLike');
+const { cachedGet } = require('./utils/httpCache');
 
 // NEA's 24-hour forecast (data.gov.sg) - no API key required.
 const NEA_24HR_FORECAST_URL = 'https://api-open.data.gov.sg/v2/real-time/api/twenty-four-hr-forecast';
@@ -46,8 +50,8 @@ app.get('/', (req, res) => {
 // Fetches Singapore's general 24-hour forecast (today's high/low, humidity,
 // wind and forecast text) from NEA via data.gov.sg.
 async function getWeatherData() {
-  const response = await axios.get(NEA_24HR_FORECAST_URL);
-  const { general } = response.data.data.records[0];
+  const data = await cachedGet(NEA_24HR_FORECAST_URL);
+  const { general } = data.data.records[0];
 
   return {
     forecastText: general.forecast.text,
@@ -61,31 +65,48 @@ async function getWeatherData() {
   };
 }
 
-// Fetches NEA's PSI and PM2.5 (air quality) readings, both reported per
-// region (west/east/central/north/south) rather than as one nationwide
-// number, so this takes the min/max across all five - same "range"
-// treatment as humidity/wind. PSI is the official composite index; PM2.5 is
-// the specific fine-particulate reading (ug/m3) PSI's worst sub-index is
-// often driven by, shown alongside it since it's the pollutant most closely
-// tied to health effects.
+// Fetches every pollutant reading NEA's PSI endpoint exposes - PSI itself
+// plus the five individual pollutants (PM2.5, PM10, O3, SO2, CO, NO2) that
+// feed into it. All are reported per region (west/east/central/north/south)
+// rather than as one nationwide number, so each takes the min/max across
+// all five, same "range" treatment as humidity/wind.
 async function getAirQualityData() {
-  const response = await axios.get(NEA_PSI_URL);
-  const { readings } = response.data.data.items[0];
-  const psiValues = Object.values(readings.psi_twenty_four_hourly);
-  const pm25Values = Object.values(readings.pm25_twenty_four_hourly);
+  const data = await cachedGet(NEA_PSI_URL);
+  const { readings } = data.data.items[0];
+
+  const range = (field) => {
+    const values = Object.values(readings[field]);
+    return { low: Math.min(...values), high: Math.max(...values) };
+  };
+
+  const psi = range('psi_twenty_four_hourly');
+  const pm25 = range('pm25_twenty_four_hourly');
+  const pm10 = range('pm10_twenty_four_hourly');
+  const o3 = range('o3_eight_hour_max');
+  const so2 = range('so2_twenty_four_hourly');
+  const co = range('co_eight_hour_max');
+  const no2 = range('no2_one_hour_max');
 
   return {
-    psiLow: Math.min(...psiValues),
-    psiHigh: Math.max(...psiValues),
-    pm25Low: Math.min(...pm25Values),
-    pm25High: Math.max(...pm25Values),
+    psiLow: psi.low, psiHigh: psi.high,
+    pm25Low: pm25.low, pm25High: pm25.high,
+    pm10Low: pm10.low, pm10High: pm10.high,
+    o3Low: o3.low, o3High: o3.high,
+    so2Low: so2.low, so2High: so2.high,
+    coLow: co.low, coHigh: co.high,
+    no2Low: no2.low, no2High: no2.high,
   };
 }
 
-// Builds today's date fields (Gregorian + lunar) for the tear-away calendar
+// Builds the date fields (Gregorian + lunar) for the tear-away calendar
 // page, anchored to Singapore time regardless of the server's own timezone.
-async function getCalendarData() {
-  const now = new Date();
+// dayOffset=1 shifts everything to tomorrow, for the ESP32's "next day
+// preview" button - note this only shifts the *calendar* (date/lunar/
+// holiday); the weather/air-quality fields elsewhere in the response stay
+// as today's/live readings, since NEA doesn't expose a same-detail forecast
+// for a specific future day the way the 24-hour endpoint does for today.
+async function getCalendarData(dayOffset = 0) {
+  const now = new Date(Date.now() + dayOffset * 24 * 60 * 60 * 1000);
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Singapore',
     year: 'numeric',
@@ -119,28 +140,49 @@ async function getCalendarData() {
   };
 }
 
-async function buildDisplayData() {
-  const [weather, airQuality, calendar] = await Promise.all([
+async function buildDisplayData(dayOffset = 0) {
+  const [weather, airQuality, liveStation, uv, calendar] = await Promise.all([
     getWeatherData(),
     getAirQualityData(),
-    getCalendarData(),
+    getLiveStationData(),
+    getUvIndexData(),
+    getCalendarData(dayOffset),
   ]);
-  return { weather: { ...weather, ...airQuality }, calendar };
+
+  const feelsLike = getFeelsLikeTemp(liveStation.avgTemp, liveStation.avgHumidity, liveStation.avgWindSpeedKmh);
+
+  return {
+    weather: { ...weather, ...airQuality, ...liveStation, ...uv, feelsLike },
+    calendar,
+  };
 }
 
-async function buildDisplaySVG() {
-  return generateSVG(await buildDisplayData());
+// preview="tomorrow" is the ESP32's "next day preview" button - see the
+// dayOffset note on getCalendarData for what it does and doesn't shift.
+function dayOffsetFromQuery(req) {
+  return req.query.preview === 'tomorrow' ? 1 : 0;
 }
 
-async function buildDisplaySVGColor() {
-  return generateSVGColor(await buildDisplayData());
+async function buildDisplaySVG(dayOffset = 0) {
+  return generateSVG(await buildDisplayData(dayOffset));
+}
+
+async function buildDisplaySVGColor(dayOffset = 0, lang = 'en') {
+  return generateSVGColor({ ...(await buildDisplayData(dayOffset)), lang });
+}
+
+// ?lang=zh switches the weather grid's cell labels to Chinese (see
+// GRID_LABELS in generateSVGColor.js) - a dev-only comparison view, not
+// wired up to the ESP32 firmware.
+function langFromQuery(req) {
+  return req.query.lang === 'zh' ? 'zh' : 'en';
 }
 
 // Core endpoint the ESP32 polls: builds today's calendar + weather layout as a
 // 1-bit packed bitmap, matching bus_where's SVG -> sharp -> packTo1Bit pipeline.
 app.get('/api/create-display-image', async (req, res) => {
   try {
-    const svgContent = await buildDisplaySVG();
+    const svgContent = await buildDisplaySVG(dayOffsetFromQuery(req));
 
     const rawBuffer = await sharp(Buffer.from(svgContent))
       .resize(800, 480, {
@@ -168,7 +210,7 @@ app.get('/api/create-display-image', async (req, res) => {
 // directly in a browser instead of the ESP32's packed 1-bit format.
 app.get('/api/preview', async (req, res) => {
   try {
-    const svgContent = await buildDisplaySVG();
+    const svgContent = await buildDisplaySVG(dayOffsetFromQuery(req));
 
     const png = await sharp(Buffer.from(svgContent))
       .resize(800, 480, {
@@ -191,7 +233,7 @@ app.get('/api/preview', async (req, res) => {
 // Seeed_GFX2's pushImage4BPP (1200x1600, 960,000 bytes).
 app.get('/api/create-display-image-color', async (req, res) => {
   try {
-    const svgContent = await buildDisplaySVGColor();
+    const svgContent = await buildDisplaySVGColor(dayOffsetFromQuery(req), langFromQuery(req));
 
     const rawBuffer = await sharp(Buffer.from(svgContent))
       .resize(1200, 1600, {
@@ -218,7 +260,7 @@ app.get('/api/create-display-image-color', async (req, res) => {
 // Dev-only preview of the color layout, rendered as a plain PNG.
 app.get('/api/preview-color', async (req, res) => {
   try {
-    const svgContent = await buildDisplaySVGColor();
+    const svgContent = await buildDisplaySVGColor(dayOffsetFromQuery(req), langFromQuery(req));
 
     const png = await sharp(Buffer.from(svgContent))
       .resize(1200, 1600, {

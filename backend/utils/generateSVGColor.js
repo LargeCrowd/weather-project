@@ -6,7 +6,7 @@ const { getZodiacOpaqueImage } = require('./stippleWatermark');
 // Seeed 13.3" Spectra 6 panel (1200x1600, 6-color: black/white/red/yellow/
 // blue/green). Same content and structure as the mono 800x480 layout in
 // generateSVG.js, reflowed for the taller portrait canvas with color accents.
-async function generateSVGColor({ weather, calendar }) {
+async function generateSVGColor({ weather, calendar, lang = 'en' }) {
   const WIDTH = 1200;
   const HEIGHT = 1600;
   // No physical clip-bar graphic (removed - risked burn-in on the e-ink
@@ -36,7 +36,7 @@ async function generateSVGColor({ weather, calendar }) {
   ${renderHeader(calendar, WIDTH, TOP_MARGIN)}
   ${renderDayNumber(calendar.day, WIDTH, dayAccent)}
   ${renderDateRow(calendar, WIDTH)}
-  ${renderWeatherGrid(weather, WIDTH, HEIGHT, timeString)}
+  ${renderWeatherGrid(weather, WIDTH, HEIGHT, timeString, lang)}
 </svg>`;
 
   return svg;
@@ -120,81 +120,148 @@ function renderDateRow(calendar, width) {
   `;
 }
 
-// The almanac-style bordered box: today's weather (centered icon block
-// flanked by two 2x2 stat grids) squeezed into the top half, with the
-// bottom half left empty - reserved for bus timings later.
-function renderWeatherGrid(weather, width, height, timeString) {
+// Cell labels. Pollutant abbreviations (PSI/PM2.5/PM10/O3/SO2/CO/NO2) are
+// used as-is in Chinese-language weather reports too, so those aren't
+// translated - only the descriptive labels are.
+const GRID_LABELS = {
+  en: {
+    high: 'HIGH', low: 'LOW', feelsLike: 'FEELS LIKE', humidity: 'HUMIDITY',
+    liveTemp: 'LIVE TEMP', liveHumidity: 'LIVE HUMIDITY', rainfall: 'RAINFALL', uv: 'UV INDEX',
+    windDir: 'WIND DIR', windSpd: 'WIND SPD', liveWindDir: 'LIVE WIND DIR', liveWindSpd: 'LIVE WIND SPD',
+    updated: 'UPDATED',
+  },
+  zh: {
+    high: '最高', low: '最低', feelsLike: '体感', humidity: '湿度',
+    liveTemp: '现时气温', liveHumidity: '现时湿度', rainfall: '降雨量', uv: '紫外线',
+    windDir: '风向', windSpd: '风速', liveWindDir: '现时风向', liveWindSpd: '现时风速',
+    updated: '更新时间',
+  },
+};
+
+// The almanac-style bordered box: a compact icon+forecast strip over a
+// dense 4x5 grid packing in every NEA data point this project fetches
+// (today's forecast range, live station readings, full pollutant
+// breakdown, UV), with a smaller reserved strip at the bottom for bus
+// timings later.
+function renderWeatherGrid(weather, width, height, timeString, lang = 'en') {
+  const L = GRID_LABELS[lang] || GRID_LABELS.en;
   const {
-    forecastText, tempHigh, tempLow, humidityHigh, humidityLow,
-    windDirection, windSpeedLow, windSpeedHigh, psiLow, psiHigh, pm25Low, pm25High,
+    forecastText,
+    tempHigh, tempLow, humidityHigh, humidityLow, windDirection, windSpeedLow, windSpeedHigh,
+    feelsLike,
+    liveTempLow, liveTempHigh, liveHumidityLow, liveHumidityHigh,
+    liveRainfallMax, liveWindDirection, liveWindSpeedLow, liveWindSpeedHigh,
+    uvIndex,
+    psiLow, psiHigh, pm25Low, pm25High, pm10Low, pm10High,
+    o3Low, o3High, so2Low, so2High, coLow, coHigh, no2Low, no2High,
   } = weather;
 
   const boxLeft = 70;
   const boxRight = width - 70;
   const outerTop = 1000;
   const outerBottom = 1580;
-  const contentBottom = outerTop + (outerBottom - outerTop) / 2;
+  // Weather gets the bulk of the box; a smaller strip at the bottom stays
+  // reserved (empty) for bus timings.
+  const contentBottom = outerTop + (outerBottom - outerTop) * 0.75;
 
-  // Everything below uses the compressed top half as its working area.
-  const boxTop = outerTop;
-  const boxBottom = contentBottom;
+  const iconStripBottom = outerTop + 90;
+  const gridTop = iconStripBottom;
+  const gridBottom = contentBottom;
+  const rowHeight = (gridBottom - gridTop) / 5;
 
-  const centerWidth = 260;
-  const sideWidth = (boxRight - boxLeft - centerWidth) / 2;
-  const leftBoundary = boxLeft + sideWidth;
-  const rightBoundary = boxRight - sideWidth;
-  const midRow = boxTop + (boxBottom - boxTop) / 2;
+  const colWidth = (boxRight - boxLeft) / 4;
+  const col0 = boxLeft + colWidth * 0.5;
+  const col1 = boxLeft + colWidth * 1.5;
+  const col2 = boxLeft + colWidth * 2.5;
+  const col3 = boxLeft + colWidth * 3.5;
+  const cols = [col0, col1, col2, col3];
 
-  const leftCol1 = boxLeft + sideWidth / 4;
-  const leftCol2 = boxLeft + (sideWidth * 3) / 4;
-  const rightCol1 = rightBoundary + sideWidth / 4;
-  const rightCol2 = rightBoundary + (sideWidth * 3) / 4;
+  const rowBoundary = (i) => gridTop + rowHeight * i;
 
-  // NEA's PSI bands: 0-50 Good, 51-100 Moderate, 101-200 Unhealthy, 201+
-  // Very Unhealthy/Hazardous - flag anything past "Moderate" in red.
+  // NEA/US EPA-style bands: flag anything past the "Moderate"/"Unhealthy"
+  // threshold in red. Where I don't have a confident published breakpoint
+  // (O3/SO2/CO/NO2), the value is just shown without a warning color.
   const psiColor = psiHigh > 100 ? SPECTRA6_HEX.red : SPECTRA6_HEX.black;
-  // US EPA PM2.5 breakpoint for "Unhealthy" (ug/m3, 24-hour).
   const pm25Color = pm25High > 55 ? SPECTRA6_HEX.red : SPECTRA6_HEX.black;
+  const pm10Color = pm10High > 254 ? SPECTRA6_HEX.red : SPECTRA6_HEX.black;
+  const uvColor = uvIndex >= 8 ? SPECTRA6_HEX.red : SPECTRA6_HEX.black;
+  const rainColor = liveRainfallMax > 0 ? SPECTRA6_HEX.blue : SPECTRA6_HEX.black;
 
   const iconColors = weatherIconColors(forecastText);
-  const centerX = (leftBoundary + rightBoundary) / 2;
+
+  // Row definitions: [ [label, value, color], x4 ] - forecast summary, live
+  // conditions, wind (forecast vs live), air quality part 1, part 2.
+  const rows = [
+    [
+      [L.high, `${tempHigh}°`, SPECTRA6_HEX.red],
+      [L.low, `${tempLow}°`, SPECTRA6_HEX.blue],
+      [L.feelsLike, `${feelsLike}°`, SPECTRA6_HEX.black],
+      [L.humidity, `${humidityLow}–${humidityHigh}%`, SPECTRA6_HEX.black],
+    ],
+    [
+      [L.liveTemp, `${liveTempLow.toFixed(1)}–${liveTempHigh.toFixed(1)}°`, SPECTRA6_HEX.black],
+      [L.liveHumidity, `${liveHumidityLow.toFixed(0)}–${liveHumidityHigh.toFixed(0)}%`, SPECTRA6_HEX.black],
+      [L.rainfall, `${liveRainfallMax.toFixed(1)}mm`, rainColor],
+      [L.uv, `${uvIndex}`, uvColor],
+    ],
+    [
+      [L.windDir, windDirection, SPECTRA6_HEX.black],
+      [L.windSpd, `${windSpeedLow}–${windSpeedHigh}km/h`, SPECTRA6_HEX.black],
+      [L.liveWindDir, liveWindDirection, SPECTRA6_HEX.black],
+      [L.liveWindSpd, `${liveWindSpeedLow.toFixed(0)}–${liveWindSpeedHigh.toFixed(0)}km/h`, SPECTRA6_HEX.black],
+    ],
+    [
+      ['PSI', `${psiLow}–${psiHigh}`, psiColor],
+      ['PM2.5', `${pm25Low}–${pm25High}`, pm25Color],
+      ['PM10', `${pm10Low}–${pm10High}`, pm10Color],
+      ['O3', `${o3Low}–${o3High}`, SPECTRA6_HEX.black],
+    ],
+    [
+      ['SO2', `${so2Low}–${so2High}`, SPECTRA6_HEX.black],
+      ['CO', `${coLow}–${coHigh}`, SPECTRA6_HEX.black],
+      ['NO2', `${no2Low}–${no2High}`, SPECTRA6_HEX.black],
+      [L.updated, timeString, SPECTRA6_HEX.black],
+    ],
+  ];
+
+  const gridLines = [];
+  for (let i = 1; i < 5; i++) {
+    const y = rowBoundary(i);
+    gridLines.push(`<line x1="${boxLeft}" y1="${y}" x2="${boxRight}" y2="${y}" stroke="${SPECTRA6_HEX.black}" stroke-width="1"/>`);
+  }
+  for (let i = 1; i < 4; i++) {
+    const x = boxLeft + colWidth * i;
+    gridLines.push(`<line x1="${x}" y1="${gridTop}" x2="${x}" y2="${gridBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="1"/>`);
+  }
+
+  const cells = rows
+    .map((row, r) => row.map(([label, value, color], c) => statCell(cols[c], rowBoundary(r), rowBoundary(r + 1), label, value, color, { labelSize: 15, valueSize: 22 })).join(''))
+    .join('');
 
   return `<g>
     <rect x="${boxLeft}" y="${outerTop}" width="${boxRight - boxLeft}" height="${outerBottom - outerTop}"
       fill="${SPECTRA6_HEX.white}" stroke="${SPECTRA6_HEX.black}" stroke-width="3"/>
+    <line x1="${boxLeft}" y1="${iconStripBottom}" x2="${boxRight}" y2="${iconStripBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="2"/>
     <line x1="${boxLeft}" y1="${contentBottom}" x2="${boxRight}" y2="${contentBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="2.5"/>
+    <rect x="${boxLeft}" y="${gridTop}" width="${boxRight - boxLeft}" height="${gridBottom - gridTop}" fill="none" stroke="${SPECTRA6_HEX.black}" stroke-width="2"/>
+    ${gridLines.join('')}
 
-    <line x1="${leftBoundary}" y1="${boxTop}" x2="${leftBoundary}" y2="${boxBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="1.5"/>
-    <line x1="${rightBoundary}" y1="${boxTop}" x2="${rightBoundary}" y2="${boxBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="1.5"/>
-    <line x1="${boxLeft}" y1="${midRow}" x2="${leftBoundary}" y2="${midRow}" stroke="${SPECTRA6_HEX.black}" stroke-width="1.5"/>
-    <line x1="${boxLeft + sideWidth / 2}" y1="${boxTop}" x2="${boxLeft + sideWidth / 2}" y2="${boxBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="1.5"/>
-    <line x1="${rightBoundary}" y1="${midRow}" x2="${boxRight}" y2="${midRow}" stroke="${SPECTRA6_HEX.black}" stroke-width="1.5"/>
-    <line x1="${rightBoundary + sideWidth / 2}" y1="${boxTop}" x2="${rightBoundary + sideWidth / 2}" y2="${boxBottom}" stroke="${SPECTRA6_HEX.black}" stroke-width="1.5"/>
-
-    <g transform="translate(${centerX - 36}, ${midRow - 90}) scale(0.6)">
+    <g transform="translate(150, ${outerTop + 12}) scale(0.55)">
       ${weatherIcon(forecastText, iconColors)}
     </g>
-    ${wrappedText(forecastText, { x: centerX, y: midRow + 30, maxCharsPerLine: 14, lineHeight: 34, fontSize: 36, fontWeight: 700, fill: SPECTRA6_HEX.black })}
+    ${wrappedText(forecastText, { x: 650, y: outerTop + 55, maxCharsPerLine: 26, lineHeight: 30, fontSize: 30, fontWeight: 700, fill: SPECTRA6_HEX.black })}
 
-    ${statCell(leftCol1, boxTop, midRow, 'HIGH', `${tempHigh}°`, SPECTRA6_HEX.red)}
-    ${statCell(leftCol2, boxTop, midRow, 'LOW', `${tempLow}°`, SPECTRA6_HEX.blue)}
-    ${statCell(leftCol1, midRow, boxBottom, 'WIND SPD', `${windSpeedLow}–${windSpeedHigh}km/h`, SPECTRA6_HEX.black)}
-    ${statCell(leftCol2, midRow, boxBottom, 'WIND DIR', windDirection, SPECTRA6_HEX.black)}
-
-    ${statCell(rightCol1, boxTop, midRow, 'PSI', `${psiLow}–${psiHigh}`, psiColor)}
-    ${statCell(rightCol2, boxTop, midRow, 'PM2.5', `${pm25Low}–${pm25High}`, pm25Color)}
-    ${statCell(rightCol1, midRow, boxBottom, 'HUMIDITY', `${humidityLow}–${humidityHigh}%`, SPECTRA6_HEX.black)}
-    ${statCell(rightCol2, midRow, boxBottom, 'UPDATED', timeString, SPECTRA6_HEX.black)}
+    ${cells}
   </g>`;
 }
 
-function statCell(centerX, top, bottom, label, value, valueColor) {
-  const labelY = top + (bottom - top) / 2 - 8;
-  const valueY = top + (bottom - top) / 2 + 32;
-  return `<text x="${centerX}" y="${labelY}" font-size="32" font-weight="500"
-      letter-spacing="1"
-      font-family="Optima" fill="${SPECTRA6_HEX.black}" text-anchor="middle">${escapeXml(label)}</text>
-    <text x="${centerX}" y="${valueY}" font-size="36" font-weight="700"
+function statCell(centerX, top, bottom, label, value, valueColor, { labelSize = 32, valueSize = 36 } = {}) {
+  const labelY = top + (bottom - top) / 2 - 10;
+  const valueY = top + (bottom - top) / 2 + 20;
+  return `<text x="${centerX}" y="${labelY}" font-size="${labelSize}" font-weight="500"
+      letter-spacing="0.5"
+      font-family="Optima, 'Kaiti SC', 'Heiti SC', 'Noto Sans CJK SC', sans-serif" fill="${SPECTRA6_HEX.black}" text-anchor="middle">${escapeXml(label)}</text>
+    <text x="${centerX}" y="${valueY}" font-size="${valueSize}" font-weight="700"
       font-family="Optima" fill="${valueColor}" text-anchor="middle">${escapeXml(String(value))}</text>`;
 }
 
