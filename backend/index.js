@@ -15,17 +15,32 @@ const { generateSVGColor } = require('./utils/generateSVGColor');
 const { packToIndexed4BPP } = require('./utils/packToIndexed4BPP');
 const { getLunarInfo } = require('./utils/lunarCalendar');
 const { getChineseMonthLabel } = require('./utils/chineseMonth');
-const { isPublicHoliday } = require('./utils/publicHolidays');
+const { getHolidayName } = require('./utils/publicHolidays');
+const { translateHolidayName } = require('./utils/holidayNames');
 const { generateFontGallerySVG, CJK_CANDIDATE_FONTS } = require('./utils/generateFontGallery');
 const { getLiveStationData } = require('./utils/liveStationData');
 const { getUvIndexData } = require('./utils/uvIndex');
 const { getFeelsLikeTemp } = require('./utils/feelsLike');
 const { cachedGet } = require('./utils/httpCache');
+const { getPhraseOfTheDay } = require('./utils/scripturePhrases');
+const { getCoupletOfTheDay } = require('./utils/couplets');
+const { getAstronomyData } = require('./utils/astronomy');
+const { getUvLevelKey, getPsiLevelKey } = require('./utils/advisoryLabels');
+const { getBusArrivals, getMrtLineHealth } = require('./utils/ltaTransport');
+const { getExpresswayTraffic } = require('./utils/trafficData');
 
 // NEA's 24-hour forecast (data.gov.sg) - no API key required.
 const NEA_24HR_FORECAST_URL = 'https://api-open.data.gov.sg/v2/real-time/api/twenty-four-hr-forecast';
 // NEA's PSI (air quality) readings, one per region - no API key required.
 const NEA_PSI_URL = 'https://api-open.data.gov.sg/v2/real-time/api/psi';
+// Bus stops tracked for next-arrival timings in the weather grid, each
+// labeled with its physical signboard name. Order here is left-to-right
+// display order (renderBusStops in generateSVGColor.js lays them out side
+// by side in this order).
+const BUS_STOPS = [
+  { code: '63321', label: 'Blk 627' },
+  { code: '63329', label: 'opp Blk 627' },
+];
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -127,7 +142,19 @@ async function getCalendarData(dayOffset = 0) {
   const lunar = getLunarInfo(year, monthNum, day);
   const chineseMonthLabel = getChineseMonthLabel(year, monthNum);
   const isoDate = `${year}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-  const publicHoliday = await isPublicHoliday(isoDate);
+  const holidayNameEnglish = await getHolidayName(isoDate);
+  const publicHoliday = !!holidayNameEnglish;
+  // The ribbon under the day number: a public holiday's name takes priority
+  // (rare and significant - Christmas, CNY, National Day), then the solar
+  // term name on the day one begins, otherwise a scripture phrase for the
+  // day (see scripturePhrases.js). A holiday and a solar term's start
+  // essentially never land on the same date, but if they ever do, the
+  // holiday wins.
+  const ribbonText = (holidayNameEnglish && translateHolidayName(holidayNameEnglish))
+    || lunar.solarTerm
+    || getPhraseOfTheDay(year, monthNum, day);
+  // The vertical scripture couplet flanking the big day number.
+  const couplet = getCoupletOfTheDay(year, monthNum, day);
 
   return {
     day,
@@ -136,23 +163,39 @@ async function getCalendarData(dayOffset = 0) {
     weekdayEnglish: parts.weekday,
     chineseMonthLabel,
     isPublicHoliday: publicHoliday,
+    couplet,
     ...lunar,
+    ribbonText,
   };
 }
 
 async function buildDisplayData(dayOffset = 0) {
-  const [weather, airQuality, liveStation, uv, calendar] = await Promise.all([
+  const [weather, airQuality, liveStation, uv, calendar, busArrivalsByStop, mrtHealth, trafficRows] = await Promise.all([
     getWeatherData(),
     getAirQualityData(),
     getLiveStationData(),
     getUvIndexData(),
     getCalendarData(dayOffset),
+    Promise.all(BUS_STOPS.map((stop) => getBusArrivals(stop.code))),
+    getMrtLineHealth(),
+    getExpresswayTraffic(),
   ]);
+  const busStops = BUS_STOPS.map((stop, i) => ({ label: stop.label, code: stop.code, arrivals: busArrivalsByStop[i] }));
 
   const feelsLike = getFeelsLikeTemp(liveStation.avgTemp, liveStation.avgHumidity, liveStation.avgWindSpeedKmh);
+  // Sunrise/sunset/moon phase aren't NEA data - computed astronomically for
+  // whichever day the calendar itself is showing (today, or tomorrow for
+  // the ESP32 preview button).
+  const astronomyDate = new Date(Date.now() + dayOffset * 24 * 60 * 60 * 1000);
+  const astronomy = getAstronomyData(astronomyDate);
+  const uvLevelKey = getUvLevelKey(uv.uvIndex);
+  const psiLevelKey = getPsiLevelKey(airQuality.psiHigh);
 
   return {
-    weather: { ...weather, ...airQuality, ...liveStation, ...uv, feelsLike },
+    weather: {
+      ...weather, ...airQuality, ...liveStation, ...uv, feelsLike, ...astronomy,
+      uvLevelKey, psiLevelKey, busStops, mrtHealth, trafficRows,
+    },
     calendar,
   };
 }
@@ -172,8 +215,8 @@ async function buildDisplaySVGColor(dayOffset = 0, lang = 'en') {
 }
 
 // ?lang=zh switches the weather grid's cell labels to Chinese (see
-// GRID_LABELS in generateSVGColor.js) - a dev-only comparison view, not
-// wired up to the ESP32 firmware.
+// GRID_LABELS in gridLayout.js) - a dev-only comparison view, not wired up
+// to the ESP32 firmware.
 function langFromQuery(req) {
   return req.query.lang === 'zh' ? 'zh' : 'en';
 }

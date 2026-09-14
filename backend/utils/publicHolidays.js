@@ -8,25 +8,27 @@ const HOLIDAYS_URL =
 let holidayDatesPromise = null;
 
 // Fetched once per process and cached - the dataset only changes annually,
-// so there's no need to refetch it for every request.
+// so there's no need to refetch it for every request. Keyed by date so the
+// holiday's (English) name is available too, not just whether it's a holiday.
 function loadHolidayDates() {
   if (!holidayDatesPromise) {
     holidayDatesPromise = axios
       .get(HOLIDAYS_URL)
-      .then((res) => new Set(res.data.result.records.map((record) => record.date)))
+      .then((res) => new Map(res.data.result.records.map((record) => [record.date, record.holiday])))
       .catch((err) => {
         console.error('Failed to load public holidays, treating dates as non-holidays:', err.message);
         holidayDatesPromise = null; // allow a retry on the next call
-        return new Set();
+        return new Map();
       });
   }
   return holidayDatesPromise;
 }
 
-// dateStr must be 'YYYY-MM-DD'.
-async function isPublicHoliday(dateStr) {
+// The holiday's English name (e.g. "Chinese New Year (Observed)"), or null
+// if dateStr isn't a public holiday. dateStr must be 'YYYY-MM-DD'.
+async function getHolidayName(dateStr) {
   const dates = await loadHolidayDates();
-  return dates.has(dateStr);
+  return dates.get(dateStr) || null;
 }
 
-module.exports = { isPublicHoliday };
+module.exports = { getHolidayName };

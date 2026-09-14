@@ -18,6 +18,13 @@ const CANDIDATE_FONTS = [
   'Baskerville',
   'Big Caslon',
   'Charter Black',
+  'Didot',
+  'Bodoni 72',
+  'Palatino',
+  'Hoefler Text',
+  'Superclarendon',
+  'Georgia',
+  'Copperplate',
 ];
 
 // macOS's built-in Simplified Chinese fonts - a mix of modern sans (PingFang/
@@ -36,6 +43,12 @@ const CJK_CANDIDATE_FONTS = [
   'Libian SC',
   'Lantinghei SC',
   'HanziPen SC',
+  'STFangsong',
+  'SimSong',
+  'Hannotate SC',
+  'Baoli SC',
+  'LingWai SC',
+  'Hiragino Sans GB',
 ];
 
 function generateFontGallerySVG(fonts = CANDIDATE_FONTS, bigSample = '10', lineSample = 'SEPTEMBER 2026') {
